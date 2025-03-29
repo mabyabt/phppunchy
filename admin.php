@@ -1,4 +1,14 @@
 <?php
+
+
+
+//pasword protection 
+
+session_start();
+if (!isset($_SESSION["user"])) {
+    header("Location: login.php");
+    exit;
+}
 // Error reporting and display
 error_reporting(E_ALL);
 ini_set('display_errors', 1);
@@ -17,7 +27,7 @@ try {
     // Create tables with improved error handling
     $conn->exec("PRAGMA foreign_keys = ON");
 
-    // Users Table (removed email field)
+    // Users Table
     $conn->exec("CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT, 
         uid TEXT UNIQUE NOT NULL, 
@@ -35,67 +45,111 @@ try {
         FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE
     )");
 
+    // Pre-calculated work hours table
+    $conn->exec("CREATE TABLE IF NOT EXISTS daily_work_hours (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        uid TEXT NOT NULL,
+        work_date DATE NOT NULL,
+        total_hours REAL NOT NULL,
+        first_check_in DATETIME,
+        last_check_out DATETIME,
+        UNIQUE(uid, work_date),
+        FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE
+    )");
+
+    // Create indexes for performance
+    $conn->exec("CREATE INDEX IF NOT EXISTS idx_attendance_uid_scantime ON attendance(uid, scan_time)");
+    $conn->exec("CREATE INDEX IF NOT EXISTS idx_attendance_scantime ON attendance(scan_time)");
+
 } catch (Exception $e) {
     die("Database Initialization Error: " . $e->getMessage());
 }
 
-// Attendance Calculation Function
-function calculateDailyWorkHours($conn) {
+// Function to update pre-calculated daily work hours
+function updateDailyWorkHours($conn) {
+    // Clear existing data to recalculate
+    $conn->exec("DELETE FROM daily_work_hours");
+
+    $query = "
+        WITH daily_attendance AS (
+            SELECT 
+                uid, 
+                date(scan_time) as work_date,
+                MIN(CASE WHEN scan_type = 'check-in' THEN scan_time END) as first_check_in,
+                MAX(CASE WHEN scan_type = 'check-out' THEN scan_time END) as last_check_out
+            FROM 
+                attendance
+            GROUP BY 
+                uid, work_date
+        )
+        INSERT INTO daily_work_hours (uid, work_date, total_hours, first_check_in, last_check_out)
+        SELECT 
+            da.uid,
+            da.work_date,
+            ROUND(JULIANDAY(da.last_check_out) - JULIANDAY(da.first_check_in)) * 24 as total_hours,
+            da.first_check_in,
+            da.last_check_out
+        FROM 
+            daily_attendance da
+    ";
+
+    $conn->exec($query);
+}
+
+// Enhanced Attendance Export Function
+function exportAttendanceReport($conn, $start_date = null, $end_date = null) {
+    // If no pre-calculation exists, update first
+    $check_table = $conn->query("SELECT COUNT(*) as count FROM daily_work_hours")->fetchArray();
+    if ($check_table['count'] == 0) {
+        updateDailyWorkHours($conn);
+    }
+
+    $query = "
+        SELECT 
+            dwh.work_date,
+            u.name,
+            u.uid,
+            dwh.first_check_in,
+            dwh.last_check_out,
+            dwh.total_hours
+        FROM 
+            daily_work_hours dwh
+        JOIN 
+            users u ON dwh.uid = u.uid
+    ";
+
+    // Add date range filtering
+    $conditions = [];
+    $params = [];
+
+    if ($start_date) {
+        $conditions[] = "dwh.work_date >= ?";
+        $params[] = $start_date;
+    }
+    if ($end_date) {
+        $conditions[] = "dwh.work_date <= ?";
+        $params[] = $end_date;
+    }
+
+    if (!empty($conditions)) {
+        $query .= " WHERE " . implode(" AND ", $conditions);
+    }
+
+    $query .= " ORDER BY dwh.work_date DESC, u.name";
+
+    // Prepare and execute query with parameters
+    $stmt = $conn->prepare($query);
+    
+    // Bind parameters if they exist
+    foreach ($params as $i => $param) {
+        $stmt->bindValue($i + 1, $param, SQLITE3_TEXT);
+    }
+
+    $result = $stmt->execute();
     $daily_hours = [];
 
-    try {
-        $query = "
-            WITH daily_attendance AS (
-                SELECT 
-                    uid, 
-                    date(scan_time) as work_date,
-                    MIN(CASE WHEN scan_type = 'check-in' THEN scan_time END) as first_check_in,
-                    MAX(CASE WHEN scan_type = 'check-out' THEN scan_time END) as last_check_out
-                FROM 
-                    attendance
-                GROUP BY 
-                    uid, work_date
-            )
-            SELECT 
-                da.uid, 
-                da.work_date,
-                da.first_check_in,
-                da.last_check_out,
-                u.name
-            FROM 
-                daily_attendance da
-            JOIN 
-                users u ON da.uid = u.uid
-            ORDER BY 
-                da.work_date DESC, u.name
-        ";
-
-        $result = $conn->query($query);
-        
-        if ($result === false) {
-            throw new Exception("Query failed: " . $conn->lastErrorMsg());
-        }
-
-        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            if ($row['first_check_in'] && $row['last_check_out']) {
-                $check_in = new DateTime($row['first_check_in']);
-                $check_out = new DateTime($row['last_check_out']);
-                
-                $interval = $check_in->diff($check_out);
-                $hours = $interval->h + ($interval->i / 60) + ($interval->s / 3600);
-                
-                $daily_hours[] = [
-                    'date' => $row['work_date'],
-                    'name' => $row['name'],
-                    'uid' => $row['uid'],
-                    'check_in' => $row['first_check_in'],
-                    'check_out' => $row['last_check_out'],
-                    'total_hours' => round($hours, 2)
-                ];
-            }
-        }
-    } catch (Exception $e) {
-        error_log("Calculation Error: " . $e->getMessage());
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $daily_hours[] = $row;
     }
 
     return $daily_hours;
@@ -113,6 +167,13 @@ try {
                 $stmt->execute();
                 break;
 
+            // Delete User
+            case "delete_user":
+                $stmt = $conn->prepare("DELETE FROM users WHERE uid = :uid");
+                $stmt->bindValue(':uid', $_POST["uid"], SQLITE3_TEXT);
+                $stmt->execute();
+                break;
+
             // Log Attendance
             case "log_attendance":
                 $stmt = $conn->prepare("INSERT INTO attendance (uid, scan_type, location, notes) VALUES (:uid, :scan_type, :location, :notes)");
@@ -125,10 +186,33 @@ try {
 
             // Export CSV
             case "export_csv":
-                $daily_hours = calculateDailyWorkHours($conn);
+                $start_date = $_POST['start_date'] ?? null;
+                $end_date = $_POST['end_date'] ?? null;
+
+                // Validate date range
+                if ($start_date && $end_date && strtotime($start_date) > strtotime($end_date)) {
+                    echo "Error: Start date must be before or equal to end date.";
+                    exit;
+                }
+
+                $daily_hours = exportAttendanceReport($conn, $start_date, $end_date);
+
+                // If no data found
+                if (empty($daily_hours)) {
+                    echo "No attendance records found for the selected date range.";
+                    exit;
+                }
 
                 header('Content-Type: text/csv; charset=utf-8');
-                header('Content-Disposition: attachment; filename=attendance_hours_log_' . date('Y-m-d') . '.csv');
+                $filename = 'attendance_report_';
+                if ($start_date && $end_date) {
+                    $filename .= $start_date . '_to_' . $end_date;
+                } else {
+                    $filename .= date('Y-m-d');
+                }
+                $filename .= '.csv';
+                header('Content-Disposition: attachment; filename=' . $filename);
+                
                 $output = fopen('php://output', 'w');
                 
                 // CSV Headers
@@ -144,11 +228,11 @@ try {
                 // Write data rows
                 foreach ($daily_hours as $entry) {
                     fputcsv($output, [
-                        $entry['date'],
+                        $entry['work_date'],
                         $entry['name'],
                         $entry['uid'],
-                        $entry['check_in'],
-                        $entry['check_out'],
+                        $entry['first_check_in'],
+                        $entry['last_check_out'],
                         $entry['total_hours']
                     ]);
                 }
@@ -170,14 +254,63 @@ $attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN 
 <html>
 <head>
     <title>RFID Attendance Management System</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
     <style>
-        body { font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; }
-        form { background: #f4f4f4; padding: 20px; margin-bottom: 20px; border-radius: 5px; }
-        input, select { margin: 5px 0; padding: 8px; width: 100%; box-sizing: border-box; }
-        button { background-color: #4CAF50; color: white; border: none; padding: 10px 20px; margin: 10px 0; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-        th { background-color: #f2f2f2; }
+        body { 
+            font-family: Arial, sans-serif; 
+            max-width: 1000px; 
+            margin: 0 auto; 
+            padding: 20px; 
+        }
+        form { 
+            background: #f4f4f4; 
+            padding: 20px; 
+            margin-bottom: 20px; 
+            border-radius: 5px; 
+        }
+        input, select { 
+            margin: 5px 0; 
+            padding: 8px; 
+            width: 100%; 
+            box-sizing: border-box; 
+        }
+        button { 
+            background-color: #4CAF50; 
+            color: white; 
+            border: none; 
+            padding: 10px 20px; 
+            margin: 10px 0; 
+        }
+        table { 
+            width: 100%; 
+            border-collapse: collapse; 
+        }
+        th, td { 
+            border: 1px solid #ddd; 
+            padding: 8px; 
+            text-align: left; 
+        }
+        th { 
+            background-color: #f2f2f2; 
+        }
+        .date-range-form {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .date-range-form label {
+            margin-right: 10px;
+        }
+        .delete-btn {
+            background: none;
+            border: none;
+            color: red;
+            cursor: pointer;
+            padding: 5px;
+        }
+        .delete-btn:hover {
+            color: darkred;
+        }
     </style>
 </head>
 <body>
@@ -215,10 +348,19 @@ $attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN 
         <button type="submit">Log Attendance</button>
     </form>
 
-    <!-- Export Attendance Hours -->
+    <!-- Export Attendance Hours with Date Range -->
     <form method="POST">
+        <h2>Download Detailed Attendance Report</h2>
         <input type="hidden" name="action" value="export_csv">
-        <button type="submit">Download Detailed Attendance Report (CSV)</button>
+        <div class="date-range-form">
+            <label for="start_date">Start Date:</label>
+            <input type="date" name="start_date" id="start_date">
+            
+            <label for="end_date">End Date:</label>
+            <input type="date" name="end_date" id="end_date">
+            
+            <button type="submit">Download CSV Report</button>
+        </div>
     </form>
 
     <!-- Registered Users List -->
@@ -227,6 +369,7 @@ $attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN 
         <tr>
             <th>Name</th>
             <th>UID</th>
+            <th>Actions</th>
         </tr>
         <?php 
         $users_reset = $conn->query("SELECT * FROM users");
@@ -234,6 +377,15 @@ $attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN 
             echo "<tr>
                 <td>{$row['name']}</td>
                 <td>{$row['uid']}</td>
+                <td>
+                    <form method='POST' onsubmit='return confirm(\"Are you sure you want to delete this user?\");'>
+                        <input type='hidden' name='action' value='delete_user'>
+                        <input type='hidden' name='uid' value='{$row['uid']}'>
+                        <button type='submit' class='delete-btn' title='Delete User'>
+                            <i class='fas fa-trash-alt'></i>
+                        </button>
+                    </form>
+                </td>
             </tr>"; 
         }
         ?>
@@ -262,6 +414,7 @@ $attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN 
     </table>
 </body>
 </html>
+
 <?php
 // Close database connection
 $conn->close();
