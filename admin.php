@@ -1,9 +1,6 @@
 <?php
 
-
-
-//pasword protection 
-
+//password protection 
 session_start();
 if (!isset($_SESSION["user"])) {
     header("Location: login.php");
@@ -63,6 +60,39 @@ try {
 
 } catch (Exception $e) {
     die("Database Initialization Error: " . $e->getMessage());
+}
+
+// Function to get currently clocked-in users
+function getCurrentlyClockedInUsers($conn) {
+    $query = "
+        WITH latest_scans AS (
+            SELECT 
+                uid,
+                scan_type,
+                scan_time,
+                ROW_NUMBER() OVER (PARTITION BY uid ORDER BY scan_time DESC) as rn
+            FROM attendance
+            WHERE date(scan_time) = date('now')
+        )
+        SELECT 
+            u.name,
+            u.uid,
+            ls.scan_time as last_scan_time,
+            ls.scan_type
+        FROM users u
+        JOIN latest_scans ls ON u.uid = ls.uid
+        WHERE ls.rn = 1 AND ls.scan_type = 'check-in'
+        ORDER BY ls.scan_time DESC
+    ";
+    
+    $result = $conn->query($query);
+    $clocked_in_users = [];
+    
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $clocked_in_users[] = $row;
+    }
+    
+    return $clocked_in_users;
 }
 
 // Function to update pre-calculated daily work hours
@@ -215,7 +245,7 @@ try {
                 
                 $output = fopen('php://output', 'w');
                 
-                // CSV Headers
+                // CSV Headers - Fixed: Added escape parameter
                 fputcsv($output, [
                     'Date', 
                     'Name', 
@@ -223,9 +253,9 @@ try {
                     'Check-In Time', 
                     'Check-Out Time', 
                     'Total Hours Worked'
-                ]);
+                ], ',', '"', '\\');
 
-                // Write data rows
+                // Write data rows - Fixed: Added escape parameter
                 foreach ($daily_hours as $entry) {
                     fputcsv($output, [
                         $entry['work_date'],
@@ -234,7 +264,7 @@ try {
                         $entry['first_check_in'],
                         $entry['last_check_out'],
                         $entry['total_hours']
-                    ]);
+                    ], ',', '"', '\\');
                 }
 
                 fclose($output);
@@ -248,6 +278,9 @@ try {
 // Fetch Users and Attendance Logs
 $users = $conn->query("SELECT * FROM users");
 $attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN users u ON a.uid = u.uid ORDER BY a.scan_time DESC");
+
+// Get currently clocked-in users
+$clocked_in_users = getCurrentlyClockedInUsers($conn);
 ?>
 
 <!DOCTYPE html>
@@ -311,10 +344,78 @@ $attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN 
         .delete-btn:hover {
             color: darkred;
         }
+        .clocked-in-section {
+            background: #e8f5e8;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            border-left: 4px solid #4CAF50;
+        }
+        .clocked-in-count {
+            font-weight: bold;
+            color: #2e7d32;
+        }
+        .no-clocked-in {
+            color: #666;
+            font-style: italic;
+        }
+        .refresh-btn {
+            background-color: #2196F3;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            margin-left: 10px;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .refresh-btn:hover {
+            background-color: #1976D2;
+        }
     </style>
 </head>
 <body>
     <h1>RFID Attendance Management System</h1>
+
+    <!-- Currently Clocked-In Users Section -->
+    <div class="clocked-in-section">
+        <h2>
+            Currently Clocked-In Users 
+            <span class="clocked-in-count">(<?php echo count($clocked_in_users); ?>)</span>
+            <button class="refresh-btn" onclick="location.reload()">
+                <i class="fas fa-sync-alt"></i> Refresh
+            </button>
+        </h2>
+        
+        <?php if (count($clocked_in_users) > 0): ?>
+            <table>
+                <tr>
+                    <th>Name</th>
+                    <th>UID</th>
+                    <th>Check-In Time</th>
+                    <th>Hours Worked Today</th>
+                </tr>
+                <?php foreach ($clocked_in_users as $user): ?>
+                    <tr>
+                        <td><?php echo htmlspecialchars($user['name']); ?></td>
+                        <td><?php echo htmlspecialchars($user['uid']); ?></td>
+                        <td><?php echo htmlspecialchars($user['last_scan_time']); ?></td>
+                        <td>
+                            <?php 
+                            // Calculate hours worked so far today
+                            $check_in_time = new DateTime($user['last_scan_time']);
+                            $current_time = new DateTime();
+                            $interval = $check_in_time->diff($current_time);
+                            $hours_worked = $interval->h + ($interval->days * 24) + ($interval->i / 60);
+                            echo number_format($hours_worked, 2) . " hours";
+                            ?>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+            </table>
+        <?php else: ?>
+            <p class="no-clocked-in">No users are currently clocked in.</p>
+        <?php endif; ?>
+    </div>
 
     <!-- Add User Form -->
     <form method="POST">
