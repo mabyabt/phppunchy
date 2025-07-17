@@ -54,9 +54,18 @@ try {
         FOREIGN KEY (uid) REFERENCES users(uid) ON DELETE CASCADE
     )");
 
+    // Settings table for app configuration
+    $conn->exec("CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )");
+
     // Create indexes for performance
     $conn->exec("CREATE INDEX IF NOT EXISTS idx_attendance_uid_scantime ON attendance(uid, scan_time)");
     $conn->exec("CREATE INDEX IF NOT EXISTS idx_attendance_scantime ON attendance(scan_time)");
+
+    // Set default settings if they don't exist
+    $conn->exec("INSERT OR IGNORE INTO settings (key, value) VALUES ('show_clocked_in', '1')");
 
 } catch (Exception $e) {
     die("Database Initialization Error: " . $e->getMessage());
@@ -116,11 +125,13 @@ function updateDailyWorkHours($conn) {
         SELECT 
             da.uid,
             da.work_date,
-            ROUND(JULIANDAY(da.last_check_out) - JULIANDAY(da.first_check_in)) * 24 as total_hours,
+            ROUND((JULIANDAY(da.last_check_out) - JULIANDAY(da.first_check_in)) * 24, 2) as total_hours,
             da.first_check_in,
             da.last_check_out
         FROM 
             daily_attendance da
+        WHERE 
+            da.first_check_in IS NOT NULL AND da.last_check_out IS NOT NULL
     ";
 
     $conn->exec($query);
@@ -186,15 +197,23 @@ function exportAttendanceReport($conn, $start_date = null, $end_date = null) {
 }
 
 // Handle Form Submissions
+$message = '';
+$message_type = '';
+
 try {
     // Add New User
     if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST["action"])) {
         switch ($_POST["action"]) {
             case "add_user":
+                if (empty($_POST["new_uid"]) || empty($_POST["new_name"])) {
+                    throw new Exception("UID and Name are required");
+                }
                 $stmt = $conn->prepare("INSERT INTO users (uid, name) VALUES (:uid, :name)");
-                $stmt->bindValue(':uid', $_POST["new_uid"], SQLITE3_TEXT);
-                $stmt->bindValue(':name', $_POST["new_name"], SQLITE3_TEXT);
+                $stmt->bindValue(':uid', trim($_POST["new_uid"]), SQLITE3_TEXT);
+                $stmt->bindValue(':name', trim($_POST["new_name"]), SQLITE3_TEXT);
                 $stmt->execute();
+                $message = "User added successfully!";
+                $message_type = "success";
                 break;
 
             // Delete User
@@ -202,6 +221,8 @@ try {
                 $stmt = $conn->prepare("DELETE FROM users WHERE uid = :uid");
                 $stmt->bindValue(':uid', $_POST["uid"], SQLITE3_TEXT);
                 $stmt->execute();
+                $message = "User deleted successfully!";
+                $message_type = "success";
                 break;
 
             // Log Attendance
@@ -212,6 +233,18 @@ try {
                 $stmt->bindValue(':location', $_POST['location'] ?? null, SQLITE3_TEXT);
                 $stmt->bindValue(':notes', $_POST['notes'] ?? null, SQLITE3_TEXT);
                 $stmt->execute();
+                $message = "Attendance logged successfully!";
+                $message_type = "success";
+                break;
+
+            // Toggle display setting
+            case "toggle_display":
+                $show_clocked_in = isset($_POST["show_clocked_in"]) ? 1 : 0;
+                $stmt = $conn->prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('show_clocked_in', ?)");
+                $stmt->bindValue(1, $show_clocked_in, SQLITE3_INTEGER);
+                $stmt->execute();
+                $message = "Display setting updated successfully!";
+                $message_type = "success";
                 break;
 
             // Export CSV
@@ -221,16 +254,14 @@ try {
 
                 // Validate date range
                 if ($start_date && $end_date && strtotime($start_date) > strtotime($end_date)) {
-                    echo "Error: Start date must be before or equal to end date.";
-                    exit;
+                    throw new Exception("Start date must be before or equal to end date.");
                 }
 
                 $daily_hours = exportAttendanceReport($conn, $start_date, $end_date);
 
                 // If no data found
                 if (empty($daily_hours)) {
-                    echo "No attendance records found for the selected date range.";
-                    exit;
+                    throw new Exception("No attendance records found for the selected date range.");
                 }
 
                 header('Content-Type: text/csv; charset=utf-8');
@@ -245,7 +276,7 @@ try {
                 
                 $output = fopen('php://output', 'w');
                 
-                // CSV Headers - Fixed: Added escape parameter
+                // CSV Headers
                 fputcsv($output, [
                     'Date', 
                     'Name', 
@@ -253,9 +284,9 @@ try {
                     'Check-In Time', 
                     'Check-Out Time', 
                     'Total Hours Worked'
-                ], ',', '"', '\\');
+                ]);
 
-                // Write data rows - Fixed: Added escape parameter
+                // Write data rows
                 foreach ($daily_hours as $entry) {
                     fputcsv($output, [
                         $entry['work_date'],
@@ -264,7 +295,7 @@ try {
                         $entry['first_check_in'],
                         $entry['last_check_out'],
                         $entry['total_hours']
-                    ], ',', '"', '\\');
+                    ]);
                 }
 
                 fclose($output);
@@ -272,12 +303,28 @@ try {
         }
     }
 } catch (Exception $e) {
+    $message = "Error: " . $e->getMessage();
+    $message_type = "error";
     error_log("Submission Error: " . $e->getMessage());
 }
 
+// Get current display setting
+$show_clocked_in = true; // Default
+try {
+    $setting_result = $conn->query("SELECT value FROM settings WHERE key = 'show_clocked_in'");
+    if ($setting_result) {
+        $setting_row = $setting_result->fetchArray(SQLITE3_ASSOC);
+        if ($setting_row) {
+            $show_clocked_in = (bool)$setting_row['value'];
+        }
+    }
+} catch (Exception $e) {
+    $show_clocked_in = true; // Default on error
+}
+
 // Fetch Users and Attendance Logs
-$users = $conn->query("SELECT * FROM users");
-$attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN users u ON a.uid = u.uid ORDER BY a.scan_time DESC");
+$users = $conn->query("SELECT * FROM users ORDER BY name");
+$attendance_logs = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN users u ON a.uid = u.uid ORDER BY a.scan_time DESC LIMIT 50");
 
 // Get currently clocked-in users
 $clocked_in_users = getCurrentlyClockedInUsers($conn);
@@ -286,237 +333,517 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
 <!DOCTYPE html>
 <html>
 <head>
-    <title>RFID Attendance Management System</title>
+    <title>RFID Attendance Management System - Admin Panel</title>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
     <style>
-        body { 
-            font-family: Arial, sans-serif; 
-            max-width: 1000px; 
-            margin: 0 auto; 
-            padding: 20px; 
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        form { 
-            background: #f4f4f4; 
-            padding: 20px; 
-            margin-bottom: 20px; 
-            border-radius: 5px; 
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f5f5f5;
+            line-height: 1.6;
         }
-        input, select { 
-            margin: 5px 0; 
-            padding: 8px; 
-            width: 100%; 
-            box-sizing: border-box; 
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 0;
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
         }
-        button { 
-            background-color: #4CAF50; 
-            color: white; 
-            border: none; 
-            padding: 10px 20px; 
-            margin: 10px 0; 
+
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
         }
-        table { 
-            width: 100%; 
-            border-collapse: collapse; 
+
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
         }
-        th, td { 
-            border: 1px solid #ddd; 
-            padding: 8px; 
-            text-align: left; 
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
         }
-        th { 
-            background-color: #f2f2f2; 
+
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
         }
-        .date-range-form {
-            display: flex;
-            gap: 10px;
-            align-items: center;
+
+        .card {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
         }
-        .date-range-form label {
-            margin-right: 10px;
+
+        .card:hover {
+            transform: translateY(-5px);
         }
-        .delete-btn {
-            background: none;
+
+        .card h3 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+            border-bottom: 2px solid #eee;
+            padding-bottom: 10px;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: 500;
+        }
+
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+
+        .form-group textarea {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 10px 20px;
             border: none;
-            color: red;
+            border-radius: 5px;
             cursor: pointer;
-            padding: 5px;
+            font-size: 14px;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-block;
         }
-        .delete-btn:hover {
-            color: darkred;
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
         }
-        .clocked-in-section {
-            background: #e8f5e8;
+
+        .btn-danger {
+            background: linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #51cf66 0%, #40c057 100%);
+        }
+
+        .btn-small {
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+
+        .message {
             padding: 15px;
             margin-bottom: 20px;
             border-radius: 5px;
-            border-left: 4px solid #4CAF50;
+            font-weight: 500;
         }
-        .clocked-in-count {
-            font-weight: bold;
-            color: #2e7d32;
+
+        .message.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
         }
-        .no-clocked-in {
-            color: #666;
-            font-style: italic;
+
+        .message.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
         }
-        .refresh-btn {
-            background-color: #2196F3;
-            color: white;
-            border: none;
-            padding: 8px 16px;
-            margin-left: 10px;
-            border-radius: 4px;
+
+        .toggle-switch {
+            position: relative;
+            display: inline-block;
+            width: 60px;
+            height: 34px;
+        }
+
+        .toggle-switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
             cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .4s;
+            border-radius: 34px;
         }
-        .refresh-btn:hover {
-            background-color: #1976D2;
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 26px;
+            width: 26px;
+            left: 4px;
+            bottom: 4px;
+            background-color: white;
+            transition: .4s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background-color: #667eea;
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(26px);
+        }
+
+        .table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+
+        .table th,
+        .table td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+
+        .table th {
+            background-color: #f8f9fa;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .table tr:hover {
+            background-color: #f8f9fa;
+        }
+
+        .status-badge {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status-badge.checked-in {
+            background-color: #d4edda;
+            color: #155724;
+        }
+
+        .status-badge.checked-out {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .stat-card .number {
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 10px;
+        }
+
+        .stat-card .label {
+            color: #666;
+            font-size: 0.9em;
+        }
+
+        .export-form {
+            display: flex;
+            gap: 10px;
+            align-items: end;
+            flex-wrap: wrap;
+        }
+
+        .export-form .form-group {
+            margin-bottom: 0;
+        }
+
+        @media (max-width: 768px) {
+            .dashboard {
+                grid-template-columns: 1fr;
+            }
+            
+            .export-form {
+                flex-direction: column;
+                align-items: stretch;
+            }
         }
     </style>
 </head>
 <body>
-    <h1>RFID Attendance Management System</h1>
-
-    <!-- Currently Clocked-In Users Section -->
-    <div class="clocked-in-section">
-        <h2>
-            Currently Clocked-In Users 
-            <span class="clocked-in-count">(<?php echo count($clocked_in_users); ?>)</span>
-            <button class="refresh-btn" onclick="location.reload()">
-                <i class="fas fa-sync-alt"></i> Refresh
-            </button>
-        </h2>
-        
-        <?php if (count($clocked_in_users) > 0): ?>
-            <table>
-                <tr>
-                    <th>Name</th>
-                    <th>UID</th>
-                    <th>Check-In Time</th>
-                    <th>Hours Worked Today</th>
-                </tr>
-                <?php foreach ($clocked_in_users as $user): ?>
-                    <tr>
-                        <td><?php echo htmlspecialchars($user['name']); ?></td>
-                        <td><?php echo htmlspecialchars($user['uid']); ?></td>
-                        <td><?php echo htmlspecialchars($user['last_scan_time']); ?></td>
-                        <td>
-                            <?php 
-                            // Calculate hours worked so far today
-                            $check_in_time = new DateTime($user['last_scan_time']);
-                            $current_time = new DateTime();
-                            $interval = $check_in_time->diff($current_time);
-                            $hours_worked = $interval->h + ($interval->days * 24) + ($interval->i / 60);
-                            echo number_format($hours_worked, 2) . " hours";
-                            ?>
-                        </td>
-                    </tr>
-                <?php endforeach; ?>
-            </table>
-        <?php else: ?>
-            <p class="no-clocked-in">No users are currently clocked in.</p>
-        <?php endif; ?>
+    <div class="header">
+        <h1><i class="fas fa-users-cog"></i> RFID Attendance Admin Panel</h1>
+        <p>Manage users, track attendance, and configure system settings</p>
     </div>
 
-    <!-- Add User Form -->
-    <form method="POST">
-        <h2>Add New User</h2>
-        <input type="hidden" name="action" value="add_user">
-        <input type="text" name="new_uid" placeholder="RFID UID" required>
-        <input type="text" name="new_name" placeholder="Full Name" required>
-        <button type="submit">Add User</button>
-    </form>
+    <div class="container">
+        <?php if ($message): ?>
+            <div class="message <?php echo $message_type; ?>">
+                <?php echo htmlspecialchars($message); ?>
+            </div>
+        <?php endif; ?>
 
-    <!-- Attendance Logging Form -->
-    <form method="POST">
-        <h2>Log Attendance</h2>
-        <input type="hidden" name="action" value="log_attendance">
-        <select name="scan_uid" required>
-            <option value="">Select User</option>
-            <?php 
-            $users_reset = $conn->query("SELECT * FROM users");
-            while ($row = $users_reset->fetchArray(SQLITE3_ASSOC)) {
-                echo "<option value='{$row['uid']}'>{$row['name']} ({$row['uid']})</option>";
-            }
-            ?>
-        </select>
-        <select name="scan_type" required>
-            <option value="">Select Scan Type</option>
-            <option value="check-in">Check-In</option>
-            <option value="check-out">Check-Out</option>
-        </select>
-        <input type="text" name="location" placeholder="Location (Optional)">
-        <input type="text" name="notes" placeholder="Notes (Optional)">
-        <button type="submit">Log Attendance</button>
-    </form>
-
-    <!-- Export Attendance Hours with Date Range -->
-    <form method="POST">
-        <h2>Download Detailed Attendance Report</h2>
-        <input type="hidden" name="action" value="export_csv">
-        <div class="date-range-form">
-            <label for="start_date">Start Date:</label>
-            <input type="date" name="start_date" id="start_date">
-            
-            <label for="end_date">End Date:</label>
-            <input type="date" name="end_date" id="end_date">
-            
-            <button type="submit">Download CSV Report</button>
+        <!-- Statistics -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="number"><?php echo $conn->query("SELECT COUNT(*) FROM users")->fetchArray()[0]; ?></div>
+                <div class="label">Total Users</div>
+            </div>
+            <div class="stat-card">
+                <div class="number"><?php echo count($clocked_in_users); ?></div>
+                <div class="label">Currently Clocked In</div>
+            </div>
+            <div class="stat-card">
+                <div class="number"><?php echo $conn->query("SELECT COUNT(*) FROM attendance WHERE date(scan_time) = date('now')")->fetchArray()[0]; ?></div>
+                <div class="label">Today's Scans</div>
+            </div>
+            <div class="stat-card">
+                <div class="number"><?php echo $conn->query("SELECT COUNT(*) FROM attendance WHERE date(scan_time) >= date('now', '-7 days')")->fetchArray()[0]; ?></div>
+                <div class="label">This Week's Scans</div>
+            </div>
         </div>
-    </form>
 
-    <!-- Registered Users List -->
-    <h2>Registered Users</h2>
-    <table>
-        <tr>
-            <th>Name</th>
-            <th>UID</th>
-            <th>Actions</th>
-        </tr>
-        <?php 
-        $users_reset = $conn->query("SELECT * FROM users");
-        while ($row = $users_reset->fetchArray(SQLITE3_ASSOC)) {
-            echo "<tr>
-                <td>{$row['name']}</td>
-                <td>{$row['uid']}</td>
-                <td>
-                    <form method='POST' onsubmit='return confirm(\"Are you sure you want to delete this user?\");'>
-                        <input type='hidden' name='action' value='delete_user'>
-                        <input type='hidden' name='uid' value='{$row['uid']}'>
-                        <button type='submit' class='delete-btn' title='Delete User'>
-                            <i class='fas fa-trash-alt'></i>
+        <div class="dashboard">
+            <!-- Display Settings -->
+            <div class="card">
+                <h3><i class="fas fa-cog"></i> Display Settings</h3>
+                <form method="POST">
+                    <input type="hidden" name="action" value="toggle_display">
+                    <div class="form-group">
+                        <label>
+                            <strong>Show Currently Clocked-In Users on Scanner Interface:</strong>
+                        </label>
+                        <div style="margin-top: 10px;">
+                            <label class="toggle-switch">
+                                <input type="checkbox" name="show_clocked_in" <?php echo $show_clocked_in ? 'checked' : ''; ?>>
+                                <span class="slider"></span>
+                            </label>
+                            <span style="margin-left: 10px;">
+                                <?php echo $show_clocked_in ? 'Currently Shown' : 'Currently Hidden'; ?>
+                            </span>
+                        </div>
+                        <small style="color: #666; display: block; margin-top: 5px;">
+                            Toggle this to show/hide the "Currently At Work" section on the main scanner interface.
+                        </small>
+                    </div>
+                    <button type="submit" class="btn">
+                        <i class="fas fa-save"></i> Update Setting
+                    </button>
+                </form>
+            </div>
+
+            <!-- Add New User -->
+            <div class="card">
+                <h3><i class="fas fa-user-plus"></i> Add New User</h3>
+                <form method="POST">
+                    <input type="hidden" name="action" value="add_user">
+                    <div class="form-group">
+                        <label>RFID UID:</label>
+                        <input type="text" name="new_uid" required placeholder="Enter RFID UID">
+                    </div>
+                    <div class="form-group">
+                        <label>Full Name:</label>
+                        <input type="text" name="new_name" required placeholder="Enter full name">
+                    </div>
+                    <button type="submit" class="btn">
+                        <i class="fas fa-plus"></i> Add User
+                    </button>
+                </form>
+            </div>
+
+            <!-- Manual Attendance Log -->
+            <div class="card">
+                <h3><i class="fas fa-clock"></i> Manual Attendance Entry</h3>
+                <form method="POST">
+                    <input type="hidden" name="action" value="log_attendance">
+                    <div class="form-group">
+                        <label>Select User:</label>
+                        <select name="scan_uid" required>
+                            <option value="">Choose a user...</option>
+                            <?php 
+                            $users_for_select = $conn->query("SELECT * FROM users ORDER BY name");
+                            while ($user = $users_for_select->fetchArray(SQLITE3_ASSOC)): 
+                            ?>
+                                <option value="<?php echo htmlspecialchars($user['uid']); ?>">
+                                    <?php echo htmlspecialchars($user['name']); ?> (<?php echo htmlspecialchars($user['uid']); ?>)
+                                </option>
+                            <?php endwhile; ?>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Scan Type:</label>
+                        <select name="scan_type" required>
+                            <option value="">Select type...</option>
+                            <option value="check-in">Check In</option>
+                            <option value="check-out">Check Out</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Location (Optional):</label>
+                        <input type="text" name="location" placeholder="Enter location">
+                    </div>
+                    <div class="form-group">
+                        <label>Notes (Optional):</label>
+                        <textarea name="notes" placeholder="Enter any notes..."></textarea>
+                    </div>
+                    <button type="submit" class="btn">
+                        <i class="fas fa-plus"></i> Log Attendance
+                    </button>
+                </form>
+            </div>
+
+            <!-- Export Reports -->
+            <div class="card">
+                <h3><i class="fas fa-download"></i> Export Reports</h3>
+                <form method="POST" class="export-form">
+                    <input type="hidden" name="action" value="export_csv">
+                    <div class="form-group">
+                        <label>Start Date:</label>
+                        <input type="date" name="start_date" value="<?php echo date('Y-m-01'); ?>">
+                    </div>
+                    <div class="form-group">
+                        <label>End Date:</label>
+                        <input type="date" name="end_date" value="<?php echo date('Y-m-d'); ?>">
+                    </div>
+                    <div class="form-group">
+                        <button type="submit" class="btn btn-success">
+                            <i class="fas fa-file-csv"></i> Export CSV
                         </button>
-                    </form>
-                </td>
-            </tr>"; 
-        }
-        ?>
-    </table>
+                    </div>
+                </form>
+            </div>
+        </div>
 
-    <!-- Attendance Logs -->
-    <h2>Recent Attendance Logs</h2>
-    <table>
-        <tr>
-            <th>Name</th>
-            <th>Scan Time</th>
-            <th>Scan Type</th>
-            <th>Location</th>
-        </tr>
-        <?php 
-        $attendance_reset = $conn->query("SELECT a.*, u.name FROM attendance a LEFT JOIN users u ON a.uid = u.uid ORDER BY a.scan_time DESC LIMIT 50");
-        while ($row = $attendance_reset->fetchArray(SQLITE3_ASSOC)) {
-            echo "<tr>
-                <td>{$row['name']}</td>
-                <td>{$row['scan_time']}</td>
-                <td>{$row['scan_type']}</td>
-                <td>{$row['location']}</td>
-            </tr>"; 
-        }
-        ?>
-    </table>
-</body>
-</html>
+        <!-- Registered Users -->
+        <div class="card">
+            <h3><i class="fas fa-users"></i> Registered Users</h3>
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>RFID UID</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php 
+                    $users_list = $conn->query("SELECT * FROM users ORDER BY name");
+                    while ($user = $users_list->fetchArray(SQLITE3_ASSOC)): 
+                        // Check if user is currently clocked in
+                        $is_clocked_in = false;
+                        foreach ($clocked_in_users as $clocked_user) {
+                            if ($clocked_user['uid'] == $user['uid']) {
+                                $is_clocked_in = true;
+                                break;
+                            }
+                        }
+                    ?>
+                        <tr>
+                            <td><?php echo htmlspecialchars($user['name']); ?></td>
+                            <td><?php echo htmlspecialchars($user['uid']); ?></td>
+                            <td>
+                                <span class="status-badge <?php echo $is_clocked_in ? 'checked-in' : 'checked-out'; ?>">
+                                    <?php echo $is_clocked_in ? 'Clocked In' : 'Clocked Out'; ?>
+                                </span>
+                            </td>
+                            <td>
+                                <form method="POST" style="display: inline;">
+                                    <input type="hidden" name="action" value="delete_user">
+                                    <input type="hidden" name="uid" value="<?php echo htmlspecialchars($user['uid']); ?>">
+                                    <button type="submit" class="btn btn-danger btn-small" 
+                                            onclick="return confirm('Are you sure you want to delete this user?')">
+                                        <i class="fas fa-trash"></i> Delete
+                                    </button>
+                                </form>
+                            </td>
+                        </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+        </div>
 
-<?php
-// Close database connection
-$conn->close();
-?>
+        <!-- Recent Attendance Logs -->
+        <div class="card">
+            <h3><i class="fas fa-history"></i> Recent Attendance Logs (Last 50)</h3>
+            <table class="table">
+                <thead>
+                    <tr>
+                        <th>Date/Time</th>
+                        <th>Name</th>
+                        <th>UID</th>
+                        <th>Type</th>
+                        <th>Location</th>
+                        <th>Notes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php while ($log = $attendance_logs->fetchArray(SQLITE3_ASSOC)): ?>
+                        <tr>
+                            <td><?php echo date('M j, Y g:i A', strtotime($log['scan_time'])); ?></td>
+                            <td><?php echo htmlspecialchars($log['name'] ?? 'Unknown'); ?></td>
+                            <td><?php echo htmlspecialchars($log['uid']); ?></td>
+                            <td>
+                                <span class="status-badge <?php echo $log['scan_type'] == 'check-in' ? 'checked-in' : 'checked-out'; ?>">
+                                    <?php echo ucfirst($log['scan_type']); ?>
+                                </span>
+                            </td>
+                            <td><?php echo htmlspecialchars($log['location'] ?? '-'); ?></td>
+                            <td><?php echo htmlspecialchars($log['notes'] ?? '-'); ?></td>
+                        </tr>
+                    <?php endwhile; ?>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        // Auto-refresh every 60 seconds to keep data current
+        setInterval(function() {
+            // Only refresh if no forms are currently being filled
+            const activeElement = document.activeElement;
+            if (activeElement.tagName !== 'INPUT' && activeElement.tagName !== 'TEXTAREA' && activeElement.tagName !== 'SELECT') {
+                location.reload();
+            }
+        }, 60000);
+    </script>

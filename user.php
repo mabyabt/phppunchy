@@ -4,6 +4,13 @@ session_start();
 try {
     $conn = new SQLite3('rfid_system.db');
     $conn->enableExceptions(true);
+    
+    // Create settings table if it doesn't exist
+    $conn->exec("CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )");
+    
 } catch (Exception $e) {
     die("Database Connection Error: " . $e->getMessage());
 }
@@ -39,6 +46,19 @@ function getCurrentlyClockedInUsers($conn) {
     }
     
     return $clocked_in_users;
+}
+
+// Function to get all registered users
+function getAllUsers($conn) {
+    $query = "SELECT * FROM users ORDER BY name";
+    $result = $conn->query($query);
+    $users = [];
+    
+    while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+        $users[] = $row;
+    }
+    
+    return $users;
 }
 
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST["rfid_uid"])) {
@@ -120,8 +140,39 @@ $timestamp = $_SESSION['timestamp'] ?? null;
 // Clear session messages
 unset($_SESSION['success'], $_SESSION['icon'], $_SESSION['timestamp']);
 
+// Handle toggle for clocked-in users display
+if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST["toggle_display"])) {
+    $show_clocked_in = isset($_POST["show_clocked_in"]) ? 1 : 0;
+    
+    $stmt = $conn->prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('show_clocked_in', ?)");
+    $stmt->bindValue(1, $show_clocked_in, SQLITE3_INTEGER);
+    $stmt->execute();
+    
+    // Redirect to prevent form resubmission
+    header("Location: " . $_SERVER['PHP_SELF']);
+    exit();
+}
+
+// Get display setting
+$show_clocked_in = true; // Default to show
+try {
+    $show_clocked_in_result = $conn->query("SELECT value FROM settings WHERE key = 'show_clocked_in'");
+    if ($show_clocked_in_result) {
+        $setting_row = $show_clocked_in_result->fetchArray(SQLITE3_ASSOC);
+        if ($setting_row) {
+            $show_clocked_in = (bool)$setting_row['value'];
+        }
+    }
+} catch (Exception $e) {
+    // If settings table doesn't exist or query fails, use default
+    $show_clocked_in = true;
+}
+
 // Get currently clocked-in users
 $clocked_in_users = getCurrentlyClockedInUsers($conn);
+
+// Get all registered users
+$all_users = getAllUsers($conn);
 ?>
 <!DOCTYPE html>
 <html>
@@ -142,9 +193,15 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
         .main-container {
             display: flex;
             gap: 30px;
-            max-width: 1200px;
+            max-width: 1400px;
             width: 100%;
             align-items: flex-start;
+        }
+        .two-column {
+            max-width: 1000px;
+        }
+        .three-column {
+            max-width: 1400px;
         }
         .scanner-container { 
             text-align: center; 
@@ -156,6 +213,14 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
             flex-shrink: 0;
         }
         .status-container {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            flex: 1;
+            max-width: 400px;
+        }
+        .users-container {
             background: white;
             padding: 20px;
             border-radius: 10px;
@@ -183,9 +248,19 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
             border-radius: 5px;
             border-left: 4px solid #4CAF50;
         }
+        .registered-users-section {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 5px;
+            border-left: 4px solid #2196F3;
+        }
         .clocked-in-count {
             font-weight: bold;
             color: #2e7d32;
+        }
+        .users-count {
+            font-weight: bold;
+            color: #1976D2;
         }
         .user-list {
             max-height: 300px;
@@ -205,6 +280,10 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
         .user-name {
             font-weight: bold;
             color: #333;
+        }
+        .user-uid {
+            font-size: 0.9em;
+            color: #666;
         }
         .user-time {
             font-size: 0.9em;
@@ -234,15 +313,50 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
         .refresh-btn:hover {
             background-color: #1976D2;
         }
-        @media (max-width: 768px) {
+        .toggle-container {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+        .toggle-form {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .toggle-btn {
+            background-color: #ffc107;
+            color: #000;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .toggle-btn:hover {
+            background-color: #e0a800;
+        }
+        .admin-note {
+            font-size: 0.9em;
+            color: #856404;
+            margin-top: 5px;
+        }
+        @media (max-width: 1024px) {
             .main-container {
                 flex-direction: column;
                 align-items: center;
             }
             .scanner-container,
-            .status-container {
+            .status-container,
+            .users-container {
                 width: 100%;
-                max-width: 400px;
+                max-width: 500px;
+            }
+            .toggle-form {
+                flex-direction: column;
+                gap: 5px;
             }
         }
     </style>
@@ -275,7 +389,18 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
     </script>
 </head>
 <body>
-    <div class="main-container">
+    <!-- Admin Toggle for Clocked-In Display 
+    <div class="toggle-container">
+        <form method="POST" class="toggle-form">
+            <input type="hidden" name="toggle_display" value="1">
+            <label for="show_clocked_in">Show Currently Clocked-In Users:</label>
+            <input type="checkbox" id="show_clocked_in" name="show_clocked_in" <?php echo $show_clocked_in ? 'checked' : ''; ?>>
+            <button type="submit" class="toggle-btn">Update Display</button>
+        </form>
+        <div class="admin-note">Admin: Toggle this setting to show/hide the currently clocked-in users section</div>
+    </div>
+
+    <div class="main-container <?php echo $show_clocked_in ? 'three-column' : 'two-column'; ?>">--!>
         <!-- Scanner Section -->
         <div class="scanner-container">
             <h2>Scan your RFID card</h2>
@@ -293,6 +418,7 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
         </div>
         
         <!-- Currently Clocked-In Users Section -->
+        <?php if ($show_clocked_in): ?>
         <div class="status-container">
             <div class="clocked-in-section">
                 <h3>
@@ -331,6 +457,11 @@ $clocked_in_users = getCurrentlyClockedInUsers($conn);
                         No one is currently clocked in
                     </div>
                 <?php endif; ?>
+            </div>
+        </div>
+        <?php endif; ?>
+
+       
             </div>
         </div>
     </div>
